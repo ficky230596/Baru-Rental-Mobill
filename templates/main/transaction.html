@@ -7,7 +7,6 @@
 
 {% block css %}
 <link rel="stylesheet" href="{{ url_for('static', filename='css/main/transaksi.css') }}">
-
 {% endblock %}
 
 {% block content %}
@@ -25,23 +24,32 @@
                     <th scope="col">Bahan Bakar</th>
                     <th scope="col">Lama Sewa</th>
                     <th scope="col">Total</th>
+                    <th scope="col">Batas Waktu</th>
                 </tr>
             </thead>
             <tbody>
                 {% for dt in data %}
                 <tr data-bs-toggle="modal" data-bs-target="#modal-{{dt._id}}" id="{{dt.order_id}}"
-                    class="transaksi-{{dt.status | lower | replace(' ', '-')}}">
-                    <td data-label="Tanggal">{{ dt.date_rent }}</td>
+                    class="transaksi-{{dt.status | lower | replace(' ', '-')}}"
+                    data-created-at="{{dt.created_at.isoformat() if dt.created_at else ''}}">
+                    <td data-label="Tanggal">{{ dt.date_rent }} {{ dt.time_rent }} WITA</td>
                     <td data-label="Nama Mobil">{{ dt.item }}</td>
                     <td data-label="Tipe Mobil">{{ dt.type_mobil }}</td>
                     <td data-label="Bahan Bakar">{{ dt.bahan_bakar }}</td>
                     <td data-label="Lama Sewa">{{ dt.lama_rental }}</td>
                     <td data-label="Total" data-target="currency">{{ dt.total }}</td>
+                    <td data-label="Batas Waktu" id="timer-{{dt.order_id}}">
+                        {% if dt.status == 'unpaid' %}
+                        <span class="timer" data-order-id="{{dt.order_id}}"></span>
+                        {% else %}
+                        -
+                        {% endif %}
+                    </td>
                 </tr>
 
                 <!-- Modal Detail Transaksi -->
                 <div class="modal fade" id="modal-{{dt._id}}" data-bs-backdrop="static" data-bs-keyboard="false"
-                    tabindex="-1" aria-labelledby="staticBackdropLabel-{{dt._id}}" aria-hidden="true">
+                    tabindexirono="modal-{{dt._id}}" aria-labelledby="staticBackdropLabel-{{dt._id}}" aria-hidden="true">
                     <div class="modal-dialog modal-dialog-centered">
                         <div class="modal-content">
                             <div class="modal-header">
@@ -65,15 +73,15 @@
                                     </li>
                                     <li class="d-flex align-items-center mb-3">
                                         <span class="label">Tanggal Sewa</span>
-                                        <span class="value">{{ dt.date_rent }} {{ dt.time_rent }}</span>
+                                        <span class="value">{{ dt.date_rent }} {{ dt.time_rent }} WITA</span>
                                     </li>
                                     <li class="d-flex align-items-center mb-3">
                                         <span class="label">Tanggal Kembali</span>
                                         <span class="value">
                                             {% if dt.status == 'canceled' %}
-                                            -  <!-- Tampilkan kosong untuk transaksi yang dibatalkan -->
+                                            -
                                             {% elif dt.actual_return_date %}
-                                            {{ dt.actual_return_date }} {{ dt.actual_return_time }} {{ dt.status_pengembalian | default('') }}
+                                            {{ dt.actual_return_date }} {{ dt.actual_return_time }} WITA {{ dt.status_pengembalian | default('') }}
                                             {% else %}
                                             Belum dikembalikan
                                             {% endif %}
@@ -81,7 +89,7 @@
                                     </li>
                                     <li class="d-flex align-items-center mb-3">
                                         <span class="label">Batas</span>
-                                        <span class="value">{{ dt.end_rent }} {{ dt.end_time }}</span>
+                                        <span class="value">{{ dt.end_rent }} {{ dt.end_time }} WITA</span>
                                     </li>
                                     <li class="d-flex align-items-center mb-3">
                                         <span class="label">Sopir</span>
@@ -103,12 +111,22 @@
                                     </li>
                                     <li class="d-flex align-items-center mb-3">
                                         <span class="label">Status</span>
-                                        <span class="value">{{ dt.status }}</span>
+                                        <span class="value status-value" data-order-id="{{dt.order_id}}">{{ dt.status }}</span>
+                                    </li>
+                                    <li class="d-flex align-items-center mb-3">
+                                        <span class="label">Batas Waktu Pembayaran</span>
+                                        <span class="value timer-modal" data-order-id="{{dt.order_id}}">
+                                            {% if dt.status == 'unpaid' %}
+                                            <span class="timer" data-order-id="{{dt.order_id}}"></span>
+                                            {% else %}
+                                            -
+                                            {% endif %}
+                                        </span>
                                     </li>
                                     {% if dt.pesan %}
                                     <li class="d-flex align-items-center mb-3">
                                         <span class="label">Alasan</span>
-                                        <span class="value">{{ dt.pesan }}</span>
+                                        <span class="value pesan-value" data-order-id="{{dt.order_id}}">{{ dt.pesan }}</span>
                                     </li>
                                     {% endif %}
                                 </ul>
@@ -130,7 +148,7 @@
                 </div>
                 {% else %}
                 <tr>
-                    <td colspan="6" class="text-center">Tidak ada transaksi</td>
+                    <td colspan="7" class="text-center">Tidak ada transaksi</td>
                 </tr>
                 {% endfor %}
             </tbody>

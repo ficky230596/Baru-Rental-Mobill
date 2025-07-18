@@ -1,138 +1,175 @@
-function cancelPayment(order_id) {
-    Swal.fire({
-        position: "top",
-        text: "Anda yakin ingin membatalkan transaksi?",
-        icon: "warning",
-        showCancelButton: true,
-        confirmButtonColor: "#3085d6",
-        cancelButtonColor: "#d33",
-        confirmButtonText: "Ya",
-    }).then((result) => {
-        if (result.isConfirmed) {
-            const button = $(`button[data-order-id="${order_id}"]`);
-            button.prop('disabled', true);
-            button.find('span').addClass('d-none');
-            button.find('.loading-icon').removeClass('d-none');
-            $.ajax({
-                url: "/api/cancelPayment",
-                type: "POST",
-                data: { order_id: order_id },
-                success: function (response) {
-                    if (response.result === 'success') {
-                        toastr.success(response.message || 'Transaksi berhasil dibatalkan');
-                        localStorage.setItem('dataDeleted', 'true');
-                        location.reload();
-                    } else {
-                        toastr.error(response.message || 'Gagal membatalkan transaksi');
-                        button.prop('disabled', false);
-                        button.find('span').removeClass('d-none');
-                        button.find('.loading-icon').addClass('d-none');
-                    }
-                },
-                error: function (xhr) {
-                    let errorMessage = 'Terjadi kesalahan saat membatalkan transaksi. Silakan coba lagi.';
-                    if (xhr.responseJSON && xhr.responseJSON.message) {
-                        errorMessage = xhr.responseJSON.message;
-                    }
-                    toastr.error(errorMessage);
-                    button.prop('disabled', false);
-                    button.find('span').removeClass('d-none');
-                    button.find('.loading-icon').addClass('d-none');
-                }
-            });
+// Fungsi untuk memulai penghitung waktu mundur
+function startTimer(createdAt, orderId) {
+    // Pastikan createdAt diuraikan dengan benar dengan zona waktu
+    const createdTime = new Date(createdAt);
+    const expiryTime = new Date(createdTime.getTime() + 10 * 60 * 1000); // 10 menit dari created_at
+    const timerElement = document.querySelector(`#timer-${orderId} .timer`);
+    const timerModalElement = document.querySelector(`.timer-modal[data-order-id="${orderId}"] .timer`);
+
+    function updateTimer() {
+        const now = new Date();
+        const timeLeft = expiryTime - now;
+
+        if (timeLeft <= 0) {
+            timerElement.textContent = "Kedaluwarsa";
+            if (timerModalElement) timerModalElement.textContent = "Kedaluwarsa";
+            clearInterval(timerInterval);
+            checkTransactionStatus(orderId); // Periksa status segera
+            return;
         }
+
+        const minutes = Math.floor(timeLeft / 1000 / 60);
+        const seconds = Math.floor((timeLeft / 1000) % 60);
+        const timeString = `${minutes}m ${seconds}s (WITA)`; // Tambahkan label WITA
+        timerElement.textContent = timeString;
+        if (timerModalElement) timerModalElement.textContent = timeString;
+    }
+
+    updateTimer();
+    const timerInterval = setInterval(updateTimer, 1000);
+}
+
+// Fungsi untuk memeriksa status transaksi
+function checkTransactionStatus(orderId) {
+    fetch(`/api/check_transaction_status/${orderId}`, {
+        method: 'GET',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.result === 'success') {
+            const row = document.getElementById(orderId);
+            const timerElement = document.querySelector(`#timer-${orderId} .timer`);
+            const statusElement = document.querySelector(`.status-value[data-order-id="${orderId}"]`);
+            const pesanElement = document.querySelector(`.pesan-value[data-order-id="${orderId}"]`);
+            const modalFooter = document.querySelector(`#modal-${orderId} .modal-footer`);
+
+            if (data.status === 'canceled') {
+                timerElement.textContent = '-';
+                statusElement.textContent = 'Dibatalkan'; // Tampilkan teks yang ramah pengguna
+                if (data.pesan && !pesanElement) {
+                    // Tambahkan elemen Alasan jika belum ada
+                    const ul = statusElement.closest('ul');
+                    const li = document.createElement('li');
+                    li.className = 'd-flex align-items-center mb-3';
+                    li.innerHTML = `<span class="label">Alasan</span><span class="value pesan-value" data-order-id="${orderId}">${data.pesan}</span>`;
+                    ul.appendChild(li);
+                } else if (pesanElement) {
+                    pesanElement.textContent = data.pesan;
+                }
+                if (modalFooter) {
+                    modalFooter.remove(); // Hapus tombol Bayar dan Batalkan
+                }
+                row.className = 'transaksi-canceled';
+                document.getElementById('payment-alert').innerHTML = `Transaksi ${orderId} telah dibatalkan: ${data.pesan || 'Alasan tidak tersedia'}`;
+                document.getElementById('payment-alert').classList.remove('d-none');
+                setTimeout(() => {
+                    document.getElementById('payment-alert').classList.add('d-none');
+                }, 5000);
+            }
+        }
+    })
+    .catch(error => {
+        console.error('Error checking transaction status:', error);
     });
 }
 
-function addStatusLabel() {
-    $('.transaksi-unpaid').addClass('table-warning');
-    $('.transaksi-canceled, .transaksi-dibatalkan, .transaksi-dibatalkan-sendiri').addClass('table-danger');
-}
+// Fungsi untuk membatalkan transaksi secara manual
+function cancelPayment(orderId) {
+    if (confirm('Apakah Anda yakin ingin membatalkan transaksi ini?')) {
+        const cancelButton = document.querySelector(`.cancel-button[data-order-id="${orderId}"]`);
+        const loadingIcon = cancelButton.querySelector('.loading-icon');
+        const buttonText = cancelButton.querySelector('span');
 
-function alertAfter() {
-    if (localStorage.getItem('dataDeleted') === 'true') {
-        toastr.success('Pesanan sudah dibatalkan');
-        localStorage.removeItem('dataDeleted');
+        loadingIcon.classList.remove('d-none');
+        buttonText.textContent = 'Membatalkan...';
+
+        fetch('/api/cancelPayment', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: `order_id=${orderId}`,
+        })
+        .then(response => response.json())
+        .then(data => {
+            loadingIcon.classList.add('d-none');
+            buttonText.textContent = 'Batalkan';
+            if (data.result === 'success') {
+                const row = document.getElementById(orderId);
+                const timerElement = document.querySelector(`#timer-${orderId} .timer`);
+                const statusElement = document.querySelector(`.status-value[data-order-id="${orderId}"]`);
+                const modalFooter = document.querySelector(`#modal-${orderId} .modal-footer`);
+                const pesanElement = document.querySelector(`.pesan-value[data-order-id="${orderId}"]`);
+
+                timerElement.textContent = '-';
+                statusElement.textContent = 'Dibatalkan'; // Tampilkan teks yang ramah pengguna
+                if (data.pesan && !pesanElement) {
+                    const ul = statusElement.closest('ul');
+                    const li = document.createElement('li');
+                    li.className = 'd-flex align-items-center mb-3';
+                    li.innerHTML = `<span class="label">Alasan</span><span class="value pesan-value" data-order-id="${orderId}">${data.pesan || 'Dibatalkan sendiri'}</span>`;
+                    ul.appendChild(li);
+                } else if (pesanElement) {
+                    pesanElement.textContent = data.pesan || 'Dibatalkan sendiri';
+                }
+                if (modalFooter) {
+                    modalFooter.remove();
+                }
+                row.className = 'transaksi-canceled';
+                document.getElementById('payment-alert').innerHTML = 'Transaksi berhasil dibatalkan';
+                document.getElementById('payment-alert').classList.remove('d-none');
+                setTimeout(() => {
+                    document.getElementById('payment-alert').classList.add('d-none');
+                }, 5000);
+            } else {
+                document.getElementById('payment-alert').innerHTML = `Gagal membatalkan transaksi: ${data.message}`;
+                document.getElementById('payment-alert').classList.remove('d-none');
+                setTimeout(() => {
+                    document.getElementById('payment-alert').classList.add('d-none');
+                }, 5000);
+            }
+        })
+        .catch(error => {
+            loadingIcon.classList.add('d-none');
+            buttonText.textContent = 'Batalkan';
+            console.error('Error cancelling payment:', error);
+            document.getElementById('payment-alert').innerHTML = 'Terjadi kesalahan saat membatalkan transaksi';
+            document.getElementById('payment-alert').classList.remove('d-none');
+            setTimeout(() => {
+                document.getElementById('payment-alert').classList.add('d-none');
+            }, 5000);
+        });
     }
 }
 
-function checkTransactionStatus() {
-    $('.transaksi-unpaid').each(function () {
-        const order_id = $(this).attr('id'); // Ambil order_id dari atribut id
-        if (order_id) {
-            $.ajax({
-                url: `/api/check_transaction_status/${order_id}`,
-                type: "GET",
-                success: function (response) {
-                    if (response.result === 'success' && response.status === 'canceled') {
-                        toastr.warning(`Transaksi ${order_id} dibatalkan otomatis karena melebihi batas waktu pembayaran`);
-                        localStorage.setItem('dataDeleted', 'true');
-                        location.reload();
-                    }
-                },
-                error: function (xhr) {
-                    console.error(`Gagal memeriksa status transaksi ${order_id}: ${xhr.statusText}`);
-                }
-            });
+// Inisialisasi saat halaman dimuat
+document.addEventListener('DOMContentLoaded', () => {
+    // Mulai penghitung untuk setiap transaksi unpaid
+    document.querySelectorAll('.timer').forEach(timer => {
+        const orderId = timer.getAttribute('data-order-id');
+        const row = document.getElementById(orderId);
+        const createdAt = row.getAttribute('data-created-at');
+        if (createdAt) {
+            startTimer(createdAt, orderId);
         }
     });
-}
 
-// Fungsi baru untuk mengurutkan tabel berdasarkan tanggal
-function sortTableByDate() {
-    const table = $('table.table'); // Pilih tabel
-    const tbody = table.find('tbody');
-    const rows = tbody.find('tr').get(); // Ambil semua baris tabel
-
-    rows.sort(function (a, b) {
-        // Ambil nilai tanggal dari kolom "Tanggal" (indeks 0)
-        const dateA = $(a).find('td[data-label="Tanggal"]').text().trim();
-        const dateB = $(b).find('td[data-label="Tanggal"]').text().trim();
-
-        // Konversi string tanggal (format DD-MMMM-YYYY) ke objek Date
-        const dateObjA = parseDate(dateA);
-        const dateObjB = parseDate(dateB);
-
-        // Urutkan dari terbaru ke terlama (descending)
-        return dateObjB - dateObjA;
+    // Tambahkan event listener untuk tombol batalkan
+    document.querySelectorAll('.cancel-button').forEach(button => {
+        button.addEventListener('click', () => {
+            const orderId = button.getAttribute('data-order-id');
+            cancelPayment(orderId);
+        });
     });
 
-    // Kosongkan tbody dan tambahkan kembali baris yang sudah diurutkan
-    tbody.empty();
-    $.each(rows, function (index, row) {
-        tbody.append(row);
-    });
-}
-
-// Fungsi untuk mengonversi string tanggal (DD-MMMM-YYYY) ke objek Date
-function parseDate(dateStr) {
-    // Contoh dateStr: "10-July-2025"
-    const parts = dateStr.split('-');
-    if (parts.length !== 3) return new Date(0); // Default jika format salah
-
-    const day = parseInt(parts[0], 10);
-    const monthNames = [
-        'January', 'February', 'March', 'April', 'May', 'June',
-        'July', 'August', 'September', 'October', 'November', 'December'
-    ];
-    const month = monthNames.indexOf(parts[1]);
-    const year = parseInt(parts[2], 10);
-
-    if (isNaN(day) || month === -1 || isNaN(year)) return new Date(0); // Default jika parsing gagal
-
-    return new Date(year, month, day);
-}
-
-$(document).ready(function () {
-    addStatusLabel();
-    alertAfter();
-    // Tambahkan event listener untuk tombol cancel
-    $('.cancel-button').on('click', function () {
-        const order_id = $(this).data('order-id');
-        cancelPayment(order_id);
-    });
-    // Periksa status transaksi setiap 30 detik
-    setInterval(checkTransactionStatus, 30000);
-    // Urutkan tabel saat halaman dimuat
-    sortTableByDate();
+    // Periksa status transaksi setiap 10 detik
+    setInterval(() => {
+        document.querySelectorAll('.timer').forEach(timer => {
+            const orderId = timer.getAttribute('data-order-id');
+            checkTransactionStatus(orderId);
+        });
+    }, 10000);
 });

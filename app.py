@@ -624,47 +624,42 @@ def transaksiUser():
         user_info = db.users.find_one({"user_id": payload["user_id"]})
         if user_info['verif'] != 'verifed':
             return redirect(url_for('verify_email'))
-        data = db.transaction.find({"user_id": payload["user_id"]})
-        return render_template('main/transaction.html', data = data,user_info=user_info)
+        data = list(db.transaction.find({"user_id": payload["user_id"]}))
+        for d in data:
+            d['created_at'] = d.get('created_at').isoformat() if d.get('created_at') else None  # Konversi ke string ISO
+        return render_template('main/transaction.html', data=data, user_info=user_info)
     except jwt.ExpiredSignatureError:
         msg = createSecreteMassage('Akses transaksi login terlebih dahulu')
-        return redirect(url_for('login', msg = msg))
+        return redirect(url_for('login', msg=msg))
     except jwt.exceptions.DecodeError:
         msg = createSecreteMassage('Akses transaksi login terlebih dahulu')
-        return redirect(url_for('login', msg = msg))
+        return redirect(url_for('login', msg=msg))
 
 @app.route('/transaksi/<id>')
 def payment(id):
     token_receive = request.cookies.get("tokenMain")
     try:
         data = db.transaction.find_one({'order_id': id})
-
-        # CEK JIKA TRANSAKSI SUDAH DIBATALKAN
         if not data or data['status'] == 'canceled':
             flash('Transaksi telah dibatalkan dan tidak dapat dilanjutkan.', 'error')
             return redirect(url_for('transaksiUser'))
-
-        # CEK MOBIL SUDAH DISEWA ATAU BELUM
         data_mobil = db.dataMobil.find_one({'id_mobil': data['id_mobil']})
         if data_mobil['status'] in ['Diproses', 'Digunakan']:
             canceltransaction(order_id=data['order_id'], msg='Sudah ada transaksi lain')
             return render_template('main/transactionDetail.html', data=data)
-        
         payload = jwt.decode(token_receive, SECRET_KEY, algorithms=['HS256'])
         user_info = db.users.find_one({"user_id": payload["user_id"]})
         if user_info['verif'] != 'verifed':
             return redirect(url_for('verify_email'))
-        
         token = data['transaction_token']
-        return render_template('main/payment.html', data=data, user_info=user_info)
-
+        client_key = os.environ.get("MIDTRANS_CLIENT_KEY")  # Tambahkan baris ini
+        return render_template('main/payment.html', data=data, user_info=user_info, client_key=client_key)
     except jwt.ExpiredSignatureError:
         msg = createSecreteMassage('Akses transaksi login terlebih dahulu')
         return redirect(url_for('login', msg=msg))
     except jwt.exceptions.DecodeError:
         msg = createSecreteMassage('Akses transaksi login terlebih dahulu')
         return redirect(url_for('login', msg=msg))
-
     
 @app.route('/detail-mobil')
 def detail():

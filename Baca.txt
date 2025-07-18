@@ -7,7 +7,18 @@ pip install -r requirements.txt
 
 push
 
+git add .
+git commit -m "Update banyak"
 git push
 
 
-git push -u origin main
+
+Dari Sanbox atau Production 
+
+File .env:Ganti MIDTRANS_SERVER_KEY dan MIDTRANS_CLIENT_KEY dengan kredensial Production dari dashboard Midtrans.
+
+
+
+
+
+

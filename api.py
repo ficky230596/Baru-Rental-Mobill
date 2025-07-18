@@ -17,6 +17,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from dbconnection import db
 from func import createSecretMessage, canceltransaction
+import pytz  # Tambahkan import pytz untuk zona waktu
 
 # Memuat variabel lingkungan dari .env
 load_dotenv()
@@ -30,11 +31,39 @@ MIDTRANS_ENV = os.environ.get("MIDTRANS_ENV", "sandbox")  # Default ke sandbox
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Inisialisasi zona waktu WITA
+WITA_TZ = pytz.timezone('Asia/Makassar')
+
 # Inisialisasi Blueprint
 api = Blueprint("api", __name__)
 
-# ------------------- Priority Queue Implementation -------------------
 
+# Fungsi transaksiUser di app.py (contoh)
+def transaksiUser():
+    user_info = ...  # Logika untuk mendapatkan informasi pengguna
+    data = db.transaction.find({"user_id": user_info["user_id"]})  # Contoh kueri MongoDB
+    WITA_TZ = pytz.timezone('Asia/Makassar')
+
+    # Konversi created_at dari string ke datetime
+    processed_data = []
+    for item in data:
+        if isinstance(item.get("created_at"), str):
+            try:
+                # Asumsikan created_at dalam format ISO
+                item["created_at"] = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
+                # Konversi ke WITA jika belum dalam zona waktu WITA
+                if item["created_at"].tzinfo is None:
+                    item["created_at"] = WITA_TZ.localize(item["created_at"])
+                else:
+                    item["created_at"] = item["created_at"].astimezone(WITA_TZ)
+            except ValueError:
+                # Jika created_at tidak valid, set ke None atau tangani sesuai kebutuhan
+                item["created_at"] = None
+        processed_data.append(item)
+
+    return render_template('main/transaction.html', data=processed_data, user_info=user_info)
+
+# ------------------- Priority Queue Implementation -------------------
 
 class PriorityQueue:
     def __init__(self):
@@ -54,13 +83,11 @@ class PriorityQueue:
     def is_empty(self):
         return len(self._queue) == 0
 
-
 # Inisialisasi antrian prioritas global dan lock
 priority_queue = PriorityQueue()
 queue_lock = Lock()
 
 # ------------------- WhatsApp Messaging -------------------
-
 
 def send_fonnte_message(
     phone: str,
@@ -117,12 +144,18 @@ def send_fonnte_message(
         f"Rp {delivery_cost:,}".replace(",", ".") if gunakan_pengantaran else "Tidak"
     )
 
+    # Tambahkan waktu pemesanan dalam WITA
+    transaction = db.transaction.find_one({"order_id": order_id})
+    date_rent = transaction.get("date_rent", "")
+    time_rent = transaction.get("time_rent", "")
+
     message_lines = [
         (
             f"Notifikasi Pemesanan Baru (Order ID: {order_id}):"
             if is_admin
             else f"Transaksi Anda (Order ID: {order_id}) telah berhasil dibayar!"
         ),
+        f"Waktu Pemesanan: {date_rent} {time_rent} WITA",  # Tambahkan WITA
         "Detail Pemesanan:",
         f"- Penyewa: {penyewa}",
         f"- Item: {item}",
@@ -201,21 +234,19 @@ def send_fonnte_message(
     finally:
         session.close()
 
-
 # ------------------- Transaction Management -------------------
 
-
 def cancel_unpaid_transactions():
-    # Inisialisasi Snap dengan lingkungan dinamis
-    is_production = MIDTRANS_ENV == "production"
+    is_production = os.environ.get("MIDTRANS_ENV") == "production"
     snap = midtransclient.Snap(
         is_production=is_production,
         server_key=os.environ.get("MIDTRANS_SERVER_KEY"),
         client_key=os.environ.get("MIDTRANS_CLIENT_KEY"),
     )
     while True:
-        now = datetime.now()
+        now = datetime.now(WITA_TZ)
         time_limit = now - timedelta(minutes=10)
+        logger.info(f"Memeriksa transaksi unpaid pada {now.isoformat()} WITA, time_limit={time_limit.isoformat()}")
         unpaid_transactions = db.transaction.find(
             {
                 "status": "unpaid",
@@ -225,61 +256,56 @@ def cancel_unpaid_transactions():
         for txn in unpaid_transactions:
             order_id = txn["order_id"]
             try:
-                # Cek status transaksi di Midtrans
                 status = snap.transactions.status(order_id)
                 if status.get("transaction_status") in ["settlement", "capture"]:
-                    logger.info(
-                        f"Transaksi {order_id} sudah dibayar, lewati pembatalan"
-                    )
+                    logger.info(f"Transaksi {order_id} sudah dibayar, lewati pembatalan")
                     db.transaction.update_one(
                         {"order_id": order_id},
                         {"$set": {"status": "sudah bayar", "status_mobil": "Diproses"}},
                     )
                     continue
-                # Batalkan transaksi di Midtrans
-                snap.transactions.cancel(order_id)
-                logger.info(f"Transaksi {order_id} dibatalkan di Midtrans")
+                # Panggil canceltransaction dari func.py
+                with queue_lock:
+                    temp_queue = PriorityQueue()
+                    while not priority_queue.is_empty():
+                        queued_transaction = priority_queue.pop()
+                        if queued_transaction["order_id"] != order_id:
+                            temp_queue.push(queued_transaction)
+                    while not temp_queue.is_empty():
+                        priority_queue.push(temp_queue.pop())
+                canceltransaction(order_id=order_id, msg="Dibatalkan karena tidak dibayar dalam 10 menit")
+                logger.info(f"Transaksi {order_id} dibatalkan karena tidak dibayar dalam 10 menit")
+                # Kirim notifikasi ke pengguna
+                user = db.users.find_one({"user_id": txn["user_id"]})
+                if user:
+                    send_fonnte_message(
+                        phone=user["phone"],
+                        order_id=order_id,
+                        penyewa=txn.get("penyewa", ""),
+                        item=txn.get("item", ""),
+                        type_mobil=txn.get("type_mobil", ""),
+                        plat=txn.get("plat", ""),
+                        bahan_bakar=txn.get("bahan_bakar", ""),
+                        seat=txn.get("seat", ""),
+                        transmisi=txn.get("transmisi", ""),
+                        total=txn.get("total", 0),
+                        lama_rental=txn.get("lama_rental", ""),
+                        biaya_sopir=txn.get("biaya_sopir", 0),
+                        gunakan_pengantaran=txn.get("gunakan_pengantaran", False),
+                        delivery_cost=txn.get("delivery_cost", 0),
+                        delivery_location=txn.get("delivery_location", ""),
+                        delivery_lat=txn.get("delivery_lat", None),
+                        delivery_lon=txn.get("delivery_lon", None),
+                        is_admin=False,
+                        message=f"Transaksi Anda (Order ID: {order_id}) telah dibatalkan karena tidak dibayar dalam 10 menit pada {now.strftime('%d-%B-%Y %H:%M')} WITA."
+                    )
             except Exception as e:
-                logger.error(
-                    f"Gagal membatalkan transaksi {order_id} di Midtrans: {str(e)}"
-                )
+                logger.error(f"Gagal memproses transaksi {order_id}: {str(e)}")
                 continue
-
-            # Hapus dari antrian prioritas
-            with queue_lock:
-                temp_queue = PriorityQueue()
-                while not priority_queue.is_empty():
-                    queued_transaction = priority_queue.pop()
-                    if queued_transaction["order_id"] != order_id:
-                        temp_queue.push(queued_transaction)
-                while not temp_queue.is_empty():
-                    priority_queue.push(temp_queue.pop())
-
-            # Perbarui database
-            db.transaction.update_one(
-                {"order_id": order_id},
-                {"$set": {"status": "canceled", "status_mobil": None}},
-            )
-            db.dataMobil.update_one(
-                {"id_mobil": txn["id_mobil"]},
-                {
-                    "$set": {
-                        "status_transaksi": None,
-                        "order_id": None,
-                        "status": "Tersedia",
-                    }
-                },
-            )
-            logger.info(
-                f"Transaksi {order_id} dibatalkan karena tidak dibayar dalam 10 menit."
-            )
-        sleep(60)  # Interval 60 detik untuk mengurangi beban server
-
+        sleep(60)
 
 # ------------------- API Endpoints -------------------
 
-
-# Endpoint untuk reverse geocoding
 @api.route("/api/reverse_geocode", methods=["GET"])
 def reverse_geocode():
     try:
@@ -294,7 +320,7 @@ def reverse_geocode():
             )
 
         headers = {
-            "User-Agent": "RentalMobilApp/1.0 (fickyrahanubun@gmail.com)"  # Ganti dengan email Anda
+            "User-Agent": "RentalMobilApp/1.0 (fickyrahanubun@gmail.com)"
         }
         url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lon}"
         response = requests.get(url, headers=headers, timeout=5)
@@ -309,8 +335,6 @@ def reverse_geocode():
             500,
         )
 
-
-# Endpoint untuk pencarian lokasi
 @api.route("/api/search_geocode", methods=["GET"])
 def search_geocode():
     try:
@@ -322,7 +346,7 @@ def search_geocode():
             )
 
         headers = {
-            "User-Agent": "RentalMobilApp/1.0 (fickyrahanubun@gmail.com)"  # Ganti dengan email Anda
+            "User-Agent": "RentalMobilApp/1.0 (fickyrahanubun@gmail.com)"
         }
         url = f"https://nominatim.openstreetmap.org/search?format=json&q={urllib.parse.quote(query)}&limit=1"
         response = requests.get(url, headers=headers, timeout=5)
@@ -334,7 +358,6 @@ def search_geocode():
             jsonify({"status": "error", "message": f"Gagal mencari lokasi: {str(e)}"}),
             500,
         )
-
 
 @api.route("/api/create_transaction", methods=["POST"])
 def create_transaction():
@@ -485,7 +508,7 @@ def create_transaction():
 
     # Buat order_id dan data transaksi
     order_id = str(uuid.uuid1())
-    now = datetime.now()
+    now = datetime.now(WITA_TZ)
     date_rent = now.strftime("%d-%B-%Y")
     time_rent = now.strftime("%H:%M")
     end_time = now + timedelta(days=hari)
@@ -493,9 +516,7 @@ def create_transaction():
     end_time = end_time.strftime("%H:%M")
 
     # Setup Midtrans
-    is_production = (
-        MIDTRANS_ENV == "production"
-    )  # jika onlo    is_production = MIDTRANS_ENV == "production"
+    is_production = MIDTRANS_ENV == "production"
     snap = midtransclient.Snap(
         is_production=is_production,
         server_key=os.environ.get("MIDTRANS_SERVER_KEY"),
@@ -567,7 +588,7 @@ def create_transaction():
     with queue_lock:
         priority_queue.push(transaksi)
     logger.info(
-        f"Transaksi {order_id} ditambahkan ke antrian prioritas dengan total {total_harga}"
+        f"Transaksi {order_id} ditambahkan ke antrian prioritas dengan total {total_harga} pada {now.isoformat()} WITA"
     )
 
     # Delay 10 detik untuk memeriksa konflik
@@ -655,7 +676,6 @@ def create_transaction():
         ),
         200,
     )
-
 
 @api.route("/api/midtrans-notification", methods=["POST"])
 def midtrans_notification():
@@ -752,20 +772,15 @@ def midtrans_notification():
         else:
             logger.error(f"Pengguna tidak ditemukan untuk order_id: {order_id}")
     elif transaction_status in ["cancel", "expire", "deny"]:
-        db.transaction.update_one(
-            {"order_id": order_id},
-            {"$set": {"status": "canceled", "status_mobil": None}},
-        )
-        db.dataMobil.update_one(
-            {"id_mobil": transaction["id_mobil"]},
-            {
-                "$set": {
-                    "status_transaksi": None,
-                    "order_id": None,
-                    "status": "Tersedia",
-                }
-            },
-        )
+        with queue_lock:
+            temp_queue = PriorityQueue()
+            while not priority_queue.is_empty():
+                queued_transaction = priority_queue.pop()
+                if queued_transaction["order_id"] != order_id:
+                    temp_queue.push(queued_transaction)
+            while not temp_queue.is_empty():
+                priority_queue.push(temp_queue.pop())
+        canceltransaction(order_id=order_id, msg=f"Dibatalkan oleh Midtrans: {transaction_status}")
         logger.info(
             f"Transaksi {order_id} dibatalkan karena status: {transaction_status}"
         )
@@ -776,7 +791,6 @@ def midtrans_notification():
         logger.info(f"Transaksi {order_id} masih dalam status pending")
 
     return jsonify({"status": "success", "message": "Notifikasi diproses"}), 200
-
 
 @api.route("/api/transaction-success", methods=["POST"])
 def transaction_success():
@@ -916,7 +930,6 @@ def transaction_success():
         200,
     )
 
-
 @api.route("/api/confirmKembali", methods=["POST"])
 def confirmKembali():
     id_mobil = request.form.get("id_mobil")
@@ -941,14 +954,14 @@ def confirmKembali():
         f"status={data_transaksi['status']}, status_mobil={data_transaksi.get('status_mobil')}"
     )
 
-    # Waktu pengembalian aktual
-    now = datetime.now()
+    # Waktu pengembalian aktual dalam WITA
+    now = datetime.now(WITA_TZ)
     actual_return_date = now.strftime("%d-%B-%Y")
     actual_return_time = now.strftime("%H:%M")
 
     # Bandingkan dengan waktu seharusnya
     end_rent_str = data_transaksi.get("end_rent") + " " + data_transaksi.get("end_time")
-    end_rent = datetime.strptime(end_rent_str, "%d-%B-%Y %H:%M")
+    end_rent = datetime.strptime(end_rent_str, "%d-%B-%Y %H:%M").replace(tzinfo=WITA_TZ)
 
     # Hitung selisih waktu dalam menit
     time_diff = now - end_rent
@@ -997,18 +1010,15 @@ def confirmKembali():
         200,
     )
 
-
 @api.route("/api/check_transaction_status/<order_id>", methods=["GET"])
 def check_transaction_status_by_id(order_id):
     logger.info(f"Memeriksa status transaksi untuk order_id: {order_id}")
     try:
-        # Cari transaksi berdasarkan order_id
         transaction = db.transaction.find_one({"order_id": order_id})
         if not transaction:
             logger.error(f"Transaksi tidak ditemukan untuk order_id: {order_id}")
             return jsonify({"result": "error", "msg": "Transaksi tidak ditemukan"}), 404
 
-        # Kembalikan status transaksi
         return (
             jsonify(
                 {
@@ -1016,6 +1026,8 @@ def check_transaction_status_by_id(order_id):
                     "order_id": transaction["order_id"],
                     "status": transaction.get("status", ""),
                     "status_mobil": transaction.get("status_mobil", ""),
+                    "pesan": transaction.get("pesan", ""),
+                    "created_at": transaction.get("created_at").replace(tzinfo=pytz.UTC).astimezone(WITA_TZ).isoformat() if transaction.get("created_at") else None,
                     "msg": "Status transaksi ditemukan",
                 }
             ),
@@ -1024,7 +1036,6 @@ def check_transaction_status_by_id(order_id):
     except Exception as e:
         logger.error(f"Error saat memeriksa status transaksi {order_id}: {str(e)}")
         return jsonify({"result": "error", "msg": f"Terjadi kesalahan: {str(e)}"}), 500
-
 
 @api.route("/api/check_transaction_status", methods=["GET"])
 def check_transaction_status():
@@ -1084,13 +1095,11 @@ def check_transaction_status():
     except jwt.InvalidTokenError:
         return jsonify({"result": "error", "msg": "Token tidak valid"}), 401
 
-
 @api.route("/api/search-dashboard")
 def searchDahboard():
     search = request.args.get("search")
     data = db.dataMobil.find({"merek": {"$regex": search, "$options": "i"}}, {"_id": 0})
     return jsonify(list(data))
-
 
 @api.route("/api/cancelPayment", methods=["POST"])
 def cancelPayment():
@@ -1197,7 +1206,6 @@ def cancelPayment():
             500,
         )
 
-
 @api.route("/api/register", methods=["POST"])
 def reg():
     username = request.form.get("username")
@@ -1284,7 +1292,6 @@ def reg():
     token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
     return jsonify({"result": "success", "token": token})
-
 
 @api.route("/api/confirmPesanan", methods=["POST"])
 def confirmPesanan():
@@ -1375,7 +1382,6 @@ def confirmPesanan():
         200,
     )
 
-
 @api.route("/api/transaction_detail/<order_id>", methods=["GET"])
 def get_transaction_detail(order_id):
     logger.info(f"Menerima permintaan untuk detail transaksi: order_id={order_id}")
@@ -1406,7 +1412,7 @@ def get_transaction_detail(order_id):
             "return_status": transaction.get("status_pengembalian", ""),
             "actual_return_date": transaction.get("actual_return_date", ""),
             "actual_return_time": transaction.get("actual_return_time", ""),
-            "biaya_sopir": transaction.get("biaya_sopir", 0),
+            "bi简化biaya_sopir": transaction.get("biaya_sopir", 0),
             "gunakan_pengantaran": transaction.get("gunakan_pengantaran", False),
             "delivery_cost": transaction.get("delivery_cost", 0),
             "delivery_location": transaction.get("delivery_location", ""),
@@ -1416,6 +1422,7 @@ def get_transaction_detail(order_id):
                 "profile_image_path", "/static/icon/user.jpg"
             ),
             "image_path": user.get("image_path", "/static/icon/user.jpg"),
+            "created_at": transaction.get("created_at").replace(tzinfo=pytz.UTC).astimezone(WITA_TZ).isoformat() if transaction.get("created_at") else None,
         }
 
         logger.info(f"Detail transaksi berhasil diambil: order_id={order_id}")
@@ -1432,7 +1439,6 @@ def get_transaction_detail(order_id):
             500,
         )
 
-
 @api.route("/api/delete_mobil", methods=["POST"])
 def delete_mobil():
     id_mobil = request.form.get("id_mobil")
@@ -1440,7 +1446,6 @@ def delete_mobil():
     db.dataMobil.delete_one({"id_mobil": id_mobil})
     os.remove(f"static/gambar/{data['gambar']}")
     return jsonify({"result": "success"})
-
 
 @api.route("/api/ambilPendapatan", methods=["POST"])
 def ambilPendapatan():
@@ -1459,7 +1464,7 @@ def ambilPendapatan():
     try:
         for dt in data:
             try:
-                bulan = datetime.strptime(dt["date_rent"], "%d-%B-%Y")
+                bulan = datetime.strptime(dt["date_rent"], "%d-%B-%Y").replace(tzinfo=WITA_TZ)
                 total[bulan.month] += int(dt.get("total", 0))
             except ValueError as e:
                 current_app.logger.error(
@@ -1477,10 +1482,9 @@ def ambilPendapatan():
             500,
         )
 
-
 @api.route("/api/get_transaksi", methods=["GET"])
 def get_transaksi():
-    date = datetime.now().strftime("%Y")
+    date = datetime.now(WITA_TZ).strftime("%Y")
     data = db.transaction.find(
         {
             "status": {"$in": ["sudah bayar", "completed"]},
@@ -1491,7 +1495,7 @@ def get_transaksi():
     try:
         for dt in data:
             try:
-                bulan = datetime.strptime(dt["date_rent"], "%d-%B-%Y")
+                bulan = datetime.strptime(dt["date_rent"], "%d-%B-%Y").replace(tzinfo=WITA_TZ)
                 total[bulan.month] += 1
             except ValueError as e:
                 current_app.logger.error(
@@ -1509,7 +1513,6 @@ def get_transaksi():
             500,
         )
 
-
 @api.route("/api/filter_transaksi", methods=["POST"])
 def filter_transaksi():
     try:
@@ -1523,7 +1526,7 @@ def filter_transaksi():
         elif mtd == "fPaid":
             query["status"] = "completed"
         elif mtd == "fUnpaid":
-            query["status"] = "Dibatalkan"
+            query["status"] = "canceled"
         elif mtd == "fDigunakan":
             query["status_mobil"] = "digunakan"
 
@@ -1545,6 +1548,7 @@ def filter_transaksi():
                 "return_status": trans.get("status_pengembalian", ""),
                 "actual_return_date": trans.get("actual_return_date", ""),
                 "actual_return_time": trans.get("actual_return_time", ""),
+                "created_at": trans.get("created_at").replace(tzinfo=pytz.UTC).astimezone(WITA_TZ).isoformat() if trans.get("created_at") else None,
             }
             for trans in transactions
         ]
@@ -1561,7 +1565,6 @@ def filter_transaksi():
             500,
         )
 
-
 @api.route("/api/get_car/<id>")
 def get_car(id):
     data = db.dataMobil.find_one({"id_mobil": id})
@@ -1571,7 +1574,6 @@ def get_car(id):
             "harga": data["harga"],
         }
     )
-
 
 @api.route("/api/add_transaction_from_admin", methods=["POST"])
 def add_transaction_from_admin():
@@ -1671,10 +1673,11 @@ def add_transaction_from_admin():
 
     # Buat transaksi
     order_id = str(uuid.uuid1())
-    date_rent = datetime.now().strftime("%d-%B-%Y")
-    time_rent = datetime.now().strftime("%H:%M")
-    end_rent = (datetime.now() + timedelta(days=hari)).strftime("%d-%B-%Y")
-    end_time = (datetime.now() + timedelta(days=hari)).strftime("%H:%M")
+    now = datetime.now(WITA_TZ)
+    date_rent = now.strftime("%d-%B-%Y")
+    time_rent = now.strftime("%H:%M")
+    end_rent = (now + timedelta(days=hari)).strftime("%d-%B-%Y")
+    end_time = (now + timedelta(days=hari)).strftime("%H:%M")
 
     transaksi = {
         "user_id": "",
@@ -1702,7 +1705,7 @@ def add_transaction_from_admin():
         "delivery_lat": delivery_lat,
         "delivery_lon": delivery_lon,
         "status_mobil": "digunakan",
-        "created_at": datetime.now(),
+        "created_at": now,
     }
 
     # Simpan transaksi ke database
@@ -1742,7 +1745,6 @@ def add_transaction_from_admin():
         ),
         200,
     )
-
 
 @api.route("/api/check_username", methods=["POST"])
 def check_username():
