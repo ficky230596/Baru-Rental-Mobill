@@ -25,7 +25,7 @@ load_dotenv()
 SECRET_KEY = os.environ.get("SECRET_KEY")
 FONNTE_TOKEN = os.environ.get("FONNTE_TOKEN")
 ADMIN_PHONE = os.environ.get("ADMIN_PHONE", "6285342860104")  # Fallback
-MIDTRANS_ENV = os.environ.get("MIDTRANS_ENV", "sandbox")  # Default ke sandbox
+MIDTRANS_ENV = os.environ.get("MIDTRANS_ENV", "production")  # Default ke sandbox
 
 # Konfigurasi logging
 logging.basicConfig(level=logging.INFO)
